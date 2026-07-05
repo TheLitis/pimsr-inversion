@@ -66,7 +66,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     val_dl = DataLoader(val_ds, batch_size=args.batch_size)
 
-    model = PimsrNet(n_obs=train_ds.n_obs, n_depth=train_ds.n_depth).to(device)
+    n_scenarios = int(train_ds.scenario.max()) + 1
+    model = PimsrNet(
+        n_obs=train_ds.n_obs, n_depth=train_ds.n_depth, n_scenarios=n_scenarios
+    ).to(device)
     thick = torch.from_numpy(grid_cell_thicknesses(train_ds.depth_grid))
     criterion = PimsrLoss(
         depth_cell_thickness=thick,
@@ -112,6 +115,7 @@ def main(argv: list[str] | None = None) -> None:
                     "model_state": model.state_dict(),
                     "n_obs": train_ds.n_obs,
                     "n_depth": train_ds.n_depth,
+                    "n_scenarios": n_scenarios,
                     "norm_stats": stats.to_dict(),
                     "periods": train_ds.periods.tolist(),
                     "depth_grid": train_ds.depth_grid.tolist(),
