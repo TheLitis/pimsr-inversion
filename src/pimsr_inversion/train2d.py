@@ -51,16 +51,22 @@ class Section2DDataset(Dataset):
         )
 
 
-def _loss(out, tgt, scen):
-    s = out["log_sigma_rho"]
-    nll = 0.5 * (s + (out["log_rho"] - tgt) ** 2 * torch.exp(-s)).mean()
+def _loss(out, tgt, scen, *, sigma_on: bool, class_weights=None):
+    if sigma_on:
+        s = out["log_sigma_rho"]
+        fit = 0.5 * (s + (out["log_rho"] - tgt) ** 2 * torch.exp(-s)).mean()
+    else:
+        # sigma warm-up: plain MSE while the mean head stabilises, so the
+        # sigma head cannot absorb early fitting error (the cause of the
+        # val-NLL divergence seen after ~epoch 20 in the first 2D run)
+        fit = 0.5 * ((out["log_rho"] - tgt) ** 2).mean()
     # total-variation smoothness prior on the predicted section
     p = out["log_rho"]
     tv = (p[:, 1:, :] - p[:, :-1, :]).abs().mean() + (
         p[:, :, 1:] - p[:, :, :-1]
     ).abs().mean()
-    ce = F.cross_entropy(out["scenario_logits"], scen)
-    return nll + 0.05 * tv + 0.1 * ce, {"nll": nll.item(), "tv": tv.item(), "ce": ce.item()}
+    ce = F.cross_entropy(out["scenario_logits"], scen, weight=class_weights)
+    return fit + 0.05 * tv + 0.1 * ce, {"fit": fit.item(), "tv": tv.item(), "ce": ce.item()}
 
 
 def main() -> None:
@@ -71,6 +77,10 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument(
+        "--sigma-warmup", type=int, default=15,
+        help="epochs of plain MSE before enabling the NLL sigma term",
+    )
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -86,6 +96,12 @@ def main() -> None:
     n, _, nf, ns = train_ds.obs.shape
     nz, nx = train_ds.target.shape[1:]
     n_scen = int(train_ds.scenario.max()) + 1
+
+    # inverse-frequency class weights for the scenario head
+    counts = np.bincount(train_ds.scenario, minlength=n_scen).astype(np.float64)
+    weights = counts.sum() / (n_scen * np.maximum(counts, 1))
+    class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
+    print(f"scenario counts: {counts.astype(int).tolist()}", flush=True)
     model = PimsrNet2D(
         n_freq=nf, n_stations=ns, n_depth=nz, n_x=nx, n_scenarios=n_scen
     ).to(device)
@@ -100,13 +116,17 @@ def main() -> None:
     history = []
 
     for epoch in range(args.epochs):
+        sigma_on = epoch >= args.sigma_warmup
         model.train()
         t0 = time.time()
         tr_loss = 0.0
         for obs, tgt, scen in train_dl:
             obs, tgt, scen = obs.to(device), tgt.to(device), scen.to(device)
             opt.zero_grad()
-            loss, _ = _loss(model(obs), tgt, scen)
+            loss, _ = _loss(
+                model(obs), tgt, scen,
+                sigma_on=sigma_on, class_weights=class_weights,
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
@@ -119,7 +139,11 @@ def main() -> None:
             for obs, tgt, scen in val_dl:
                 obs, tgt, scen = obs.to(device), tgt.to(device), scen.to(device)
                 out = model(obs)
-                loss, _ = _loss(out, tgt, scen)
+                # validation always scores the full NLL objective so that
+                # checkpoint selection is comparable across warm-up boundary
+                loss, _ = _loss(
+                    out, tgt, scen, sigma_on=True, class_weights=class_weights
+                )
                 va_loss += loss.item() * obs.size(0)
                 va_rmse += ((out["log_rho"] - tgt) ** 2).mean().sqrt().item() * obs.size(0)
         va_loss /= len(val_ds)
