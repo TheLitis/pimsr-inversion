@@ -51,10 +51,15 @@ class Section2DDataset(Dataset):
         )
 
 
-def _loss(out, tgt, scen, *, sigma_on: bool, class_weights=None):
+def _loss(out, tgt, scen, *, sigma_on: bool, class_weights=None, sigma_reg: float = 0.0):
     if sigma_on:
         s = out["log_sigma_rho"]
         fit = 0.5 * (s + (out["log_rho"] - tgt) ** 2 * torch.exp(-s)).mean()
+        if sigma_reg > 0:
+            # Quadratic penalty on log-sigma keeps the sigma head near a
+            # homoscedastic prior; prevents the runaway val-NLL divergence
+            # (sigma collapse on train residuals) seen in both 2D runs.
+            fit = fit + sigma_reg * (s**2).mean()
     else:
         # sigma warm-up: plain MSE while the mean head stabilises, so the
         # sigma head cannot absorb early fitting error (the cause of the
@@ -80,6 +85,10 @@ def main() -> None:
     ap.add_argument(
         "--sigma-warmup", type=int, default=15,
         help="epochs of plain MSE before enabling the NLL sigma term",
+    )
+    ap.add_argument(
+        "--sigma-reg", type=float, default=0.05,
+        help="quadratic penalty weight on log-sigma (0 disables)",
     )
     args = ap.parse_args()
 
@@ -126,6 +135,7 @@ def main() -> None:
             loss, _ = _loss(
                 model(obs), tgt, scen,
                 sigma_on=sigma_on, class_weights=class_weights,
+                sigma_reg=args.sigma_reg,
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -141,6 +151,7 @@ def main() -> None:
                 out = model(obs)
                 # validation always scores the full NLL objective so that
                 # checkpoint selection is comparable across warm-up boundary
+                # val scores plain NLL (no reg) — comparable across configs
                 loss, _ = _loss(
                     out, tgt, scen, sigma_on=True, class_weights=class_weights
                 )
