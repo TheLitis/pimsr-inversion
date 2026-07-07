@@ -20,13 +20,40 @@ def test_loss_backward():
     x = torch.randn(2, 2, 24, 16)
     tgt = torch.randn(2, 48, 64)
     scen = torch.tensor([0, 3])
-    loss, parts = _loss(model(x), tgt, scen)
+    loss, parts = _loss(model(x), tgt, scen, sigma_on=True, sigma_reg=0.05)
     assert torch.isfinite(loss)
     loss.backward()
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     assert len(grads) > 0
     assert all(torch.isfinite(g).all() for g in grads)
-    assert set(parts) == {"nll", "tv", "ce"}
+    assert set(parts) == {"fit", "tv", "ce"}
+
+
+def test_loss_warmup_mse_mode():
+    # during sigma warm-up the loss must ignore the sigma head entirely
+    model = PimsrNet2D(n_freq=24, n_stations=16, n_depth=48, n_x=64, n_scenarios=5)
+    x = torch.randn(2, 2, 24, 16)
+    tgt = torch.randn(2, 48, 64)
+    scen = torch.tensor([1, 2])
+    out = model(x)
+    loss_mse, _ = _loss(out, tgt, scen, sigma_on=False)
+    assert torch.isfinite(loss_mse)
+    # sigma head must receive no gradient in warm-up mode
+    loss_mse.backward()
+    sigma_params = [
+        p for n, p in model.named_parameters() if "sigma" in n and p.grad is not None
+    ]
+    assert all(torch.count_nonzero(p.grad) == 0 for p in sigma_params)
+
+
+def test_loss_class_weights():
+    model = PimsrNet2D(n_freq=24, n_stations=16, n_depth=48, n_x=64, n_scenarios=5)
+    x = torch.randn(2, 2, 24, 16)
+    tgt = torch.randn(2, 48, 64)
+    scen = torch.tensor([0, 4])
+    w = torch.tensor([2.0, 1.0, 1.0, 1.0, 0.5])
+    loss, _ = _loss(model(x), tgt, scen, sigma_on=True, class_weights=w)
+    assert torch.isfinite(loss)
 
 
 def test_odd_input_sizes():
