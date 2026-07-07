@@ -29,9 +29,13 @@ class Section2DDataset(Dataset):
         with h5py.File(path, "r") as f:
             lr = f["obs_mt_log10_rho"][:].astype(np.float32)  # (N, F, S)
             ph = f["obs_mt_phase"][:].astype(np.float32) / 45.0
+            chans = [lr, ph]
+            if "obs_mt_log10_rho_tm" in f:  # v3 TE+TM datasets
+                chans.append(f["obs_mt_log10_rho_tm"][:].astype(np.float32))
+                chans.append(f["obs_mt_phase_tm"][:].astype(np.float32) / 45.0)
             self.target = f["target_log10_res"][:].astype(np.float32)  # (N, Z, X)
             self.scenario = f["scenario"][:].astype(np.int64)
-        self.obs = np.stack([lr, ph], axis=1)  # (N, 2, F, S)
+        self.obs = np.stack(chans, axis=1)  # (N, 2 or 4, F, S)
         if stats is None:
             stats = {
                 "mean": self.obs.mean(axis=(0, 2, 3), keepdims=True),
@@ -51,10 +55,23 @@ class Section2DDataset(Dataset):
         )
 
 
-def _loss(out, tgt, scen, *, sigma_on: bool, class_weights=None, sigma_reg: float = 0.0):
+def _loss(
+    out, tgt, scen, *,
+    sigma_on: bool, class_weights=None, sigma_reg: float = 0.0,
+    beta: float = 0.0,
+):
     if sigma_on:
         s = out["log_sigma_rho"]
-        fit = 0.5 * (s + (out["log_rho"] - tgt) ** 2 * torch.exp(-s)).mean()
+        nll = 0.5 * (s + (out["log_rho"] - tgt) ** 2 * torch.exp(-s))
+        if beta > 0:
+            # beta-NLL (Seitzer et al. 2022): per-pixel NLL reweighted by
+            # sigma^(2*beta), gradient-stopped. Interpolates between plain
+            # NLL (beta=0) and MSE-like weighting (beta=1); prevents
+            # well-fit pixels' shrinking sigma from dominating the gradient
+            # — the root cause of the val-NLL divergence, addressed here at
+            # the objective rather than patched by warm-up/regularisation.
+            nll = nll * torch.exp(s.detach() * beta)
+        fit = nll.mean()
         if sigma_reg > 0:
             # Quadratic penalty on log-sigma keeps the sigma head near a
             # homoscedastic prior; prevents the runaway val-NLL divergence
@@ -90,6 +107,14 @@ def main() -> None:
         "--sigma-reg", type=float, default=0.05,
         help="quadratic penalty weight on log-sigma (0 disables)",
     )
+    ap.add_argument(
+        "--beta", type=float, default=0.0,
+        help="beta-NLL exponent (0 = plain NLL, 0.5 recommended)",
+    )
+    ap.add_argument(
+        "--scen-head", default="gap", choices=["gap", "multiscale"],
+        help="scenario head architecture",
+    )
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -102,7 +127,7 @@ def main() -> None:
     )
     val_dl = DataLoader(val_ds, batch_size=args.batch_size, num_workers=2)
 
-    n, _, nf, ns = train_ds.obs.shape
+    n, n_ch, nf, ns = train_ds.obs.shape
     nz, nx = train_ds.target.shape[1:]
     n_scen = int(train_ds.scenario.max()) + 1
 
@@ -112,8 +137,10 @@ def main() -> None:
     class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
     print(f"scenario counts: {counts.astype(int).tolist()}", flush=True)
     model = PimsrNet2D(
-        n_freq=nf, n_stations=ns, n_depth=nz, n_x=nx, n_scenarios=n_scen
+        n_freq=nf, n_stations=ns, n_depth=nz, n_x=nx, n_scenarios=n_scen,
+        in_channels=n_ch, scen_head=args.scen_head,
     ).to(device)
+    print(f"in_channels: {n_ch} | scen_head: {args.scen_head} | beta: {args.beta}", flush=True)
     print(f"params: {sum(p.numel() for p in model.parameters()):,}", flush=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -135,7 +162,7 @@ def main() -> None:
             loss, _ = _loss(
                 model(obs), tgt, scen,
                 sigma_on=sigma_on, class_weights=class_weights,
-                sigma_reg=args.sigma_reg,
+                sigma_reg=args.sigma_reg, beta=args.beta,
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -180,6 +207,8 @@ def main() -> None:
                     "stats_std": train_ds.stats["std"],
                     "n_freq": nf, "n_stations": ns,
                     "n_depth": nz, "n_x": nx, "n_scenarios": n_scen,
+                    "in_channels": n_ch, "scen_head": args.scen_head,
+                    "beta": args.beta,
                     "epoch": epoch, "val_loss": va_loss, "val_rmse": va_rmse,
                 },
                 out_dir / "best2d.pt",

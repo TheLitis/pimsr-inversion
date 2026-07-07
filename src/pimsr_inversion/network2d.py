@@ -34,6 +34,25 @@ def _block(cin: int, cout: int) -> nn.Sequential:
 class PimsrNet2D(nn.Module):
     """Pseudo-section -> resistivity section with uncertainty."""
 
+    @classmethod
+    def from_checkpoint(cls, ckpt: dict) -> "PimsrNet2D":
+        """Rebuild the network from a training checkpoint dict.
+
+        Handles both legacy TE-only checkpoints (no ``in_channels`` /
+        ``scen_head`` keys) and v3 TE+TM checkpoints.
+        """
+        model = cls(
+            n_freq=int(ckpt["n_freq"]),
+            n_stations=int(ckpt["n_stations"]),
+            n_depth=int(ckpt["n_depth"]),
+            n_x=int(ckpt["n_x"]),
+            n_scenarios=int(ckpt["n_scenarios"]),
+            in_channels=int(ckpt.get("in_channels", 2)),
+            scen_head=str(ckpt.get("scen_head", "gap")),
+        )
+        model.load_state_dict(ckpt["model_state"])
+        return model
+
     def __init__(
         self,
         n_freq: int = 24,
@@ -42,13 +61,17 @@ class PimsrNet2D(nn.Module):
         n_x: int = 64,
         n_scenarios: int = 5,
         width: int = 48,
+        in_channels: int = 2,
+        scen_head: str = "gap",
     ) -> None:
         super().__init__()
         self.n_depth = n_depth
         self.n_x = n_x
+        self.in_channels = in_channels
+        self.scen_head_kind = scen_head
         w = width
 
-        self.enc1 = _block(2, w)
+        self.enc1 = _block(in_channels, w)
         self.enc2 = _block(w, 2 * w)
         self.enc3 = _block(2 * w, 4 * w)
         self.pool = nn.MaxPool2d(2)
@@ -62,8 +85,28 @@ class PimsrNet2D(nn.Module):
 
         self.head_rho = nn.Conv2d(w, 1, 1)
         self.head_sigma = nn.Conv2d(w, 1, 1)
-        self.head_scen = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(4 * w, n_scenarios)
+        if scen_head == "gap":
+            # v1: global average pool of the bottleneck only
+            self.head_scen = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(4 * w, n_scenarios)
+            )
+        elif scen_head == "multiscale":
+            # v3: avg+max pooling over both the bottleneck (context) and the
+            # finest decoder features (small lenses survive max-pooling that
+            # a global average washes out), fused by a small MLP.
+            self.head_scen = nn.Sequential(
+                nn.Linear(2 * (4 * w) + 2 * w, 2 * w),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(2 * w, n_scenarios),
+            )
+        else:
+            raise ValueError(f"unknown scen_head: {scen_head}")
+
+    @staticmethod
+    def _avgmax(t: torch.Tensor) -> torch.Tensor:
+        return torch.cat(
+            [t.mean(dim=(2, 3)), t.amax(dim=(2, 3))], dim=1
         )
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -77,6 +120,13 @@ class PimsrNet2D(nn.Module):
         d1 = F.interpolate(d2, size=e1.shape[-2:], mode="bilinear", align_corners=False)
         d1 = self.dec1(torch.cat([d1, e1], dim=1))
 
+        if self.scen_head_kind == "gap":
+            scen_logits = self.head_scen(m)
+        else:
+            scen_logits = self.head_scen(
+                torch.cat([self._avgmax(m), self._avgmax(d1)], dim=1)
+            )
+
         # warp from pseudo-section raster to the physical (depth, x) raster
         out = F.interpolate(
             d1, size=(self.n_depth, self.n_x), mode="bilinear", align_corners=False
@@ -84,5 +134,5 @@ class PimsrNet2D(nn.Module):
         return {
             "log_rho": self.head_rho(out).squeeze(1),
             "log_sigma_rho": self.head_sigma(out).squeeze(1).clamp(-10.0, 6.0),
-            "scenario_logits": self.head_scen(m),
+            "scenario_logits": scen_logits,
         }

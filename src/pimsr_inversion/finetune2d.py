@@ -68,10 +68,27 @@ def build_profile_obs(
     nearest = np.array([int(np.argmin(np.abs(x_km - x))) for x in x_model])
     mask = mask_st[:, nearest]
 
-    return {
+    out = {
         "lr": lr, "ph": ph, "mask": mask,
         "x_model": x_model, "x_km": x_km, "periods": periods,
     }
+
+    # per-mode observations for v3 4-channel models
+    from pimsr_benchmarks.emtf import resample_station_modes
+
+    for mode in ("te", "tm"):
+        lr_m = np.empty((n_f, len(profile)))
+        ph_m = np.empty((n_f, len(profile)))
+        for j, st in enumerate(profile):
+            m = resample_station_modes(st, periods)
+            lr_m[:, j], ph_m[:, j] = m[f"lr_{mode}"], m[f"ph_{mode}"]
+        out[f"lr_{mode}"] = np.stack(
+            [np.interp(x_model, x_km, lr_m[i]) for i in range(n_f)]
+        )
+        out[f"ph_{mode}"] = np.stack(
+            [np.interp(x_model, x_km, ph_m[i]) for i in range(n_f)]
+        )
+    return out
 
 
 def _physics_misfit(
@@ -119,14 +136,7 @@ def finetune2d(
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(checkpoint, map_location=dev, weights_only=False)
 
-    model = PimsrNet2D(
-        n_freq=int(ckpt["n_freq"]),
-        n_stations=int(ckpt["n_stations"]),
-        n_depth=int(ckpt["n_depth"]),
-        n_x=int(ckpt["n_x"]),
-        n_scenarios=int(ckpt["n_scenarios"]),
-    )
-    model.load_state_dict(ckpt["model_state"])
+    model = PimsrNet2D.from_checkpoint(ckpt)
     model.to(dev).train()
     anchor = {k: v.detach().clone() for k, v in model.named_parameters()}
 
@@ -148,12 +158,24 @@ def finetune2d(
         [int(np.argmin(np.abs(xg_norm - s))) for s in sx_norm], dtype=torch.long
     )
 
-    obs_np = np.stack([prof["lr"], prof["ph"] / PHASE_SCALE])[None].astype(np.float32)
+    if model.in_channels == 4:
+        obs_np = np.stack(
+            [prof["lr_te"], prof["ph_te"] / PHASE_SCALE,
+             prof["lr_tm"], prof["ph_tm"] / PHASE_SCALE]
+        )[None].astype(np.float32)
+        # physics target: TE observations (1D column response equals both
+        # modes for a layered column; TE keeps continuity with the 1D recipe)
+        t_lr_np, t_ph_np = prof["lr_te"], prof["ph_te"]
+    else:
+        obs_np = np.stack(
+            [prof["lr"], prof["ph"] / PHASE_SCALE]
+        )[None].astype(np.float32)
+        t_lr_np, t_ph_np = prof["lr"], prof["ph"]
     obs_np = (obs_np - ckpt["stats_mean"]) / ckpt["stats_std"]
     x = torch.from_numpy(obs_np).to(dev)
 
-    t_lr = torch.from_numpy(prof["lr"]).to(dev)
-    t_ph = torch.from_numpy(prof["ph"]).to(dev)
+    t_lr = torch.from_numpy(t_lr_np).to(dev)
+    t_ph = torch.from_numpy(t_ph_np).to(dev)
     t_mask = torch.from_numpy(prof["mask"]).to(dev)
     thick = torch.tensor(np.diff(depth_grid), dtype=torch.float64)
     periods_t = torch.tensor(prof["periods"], dtype=torch.float64)
