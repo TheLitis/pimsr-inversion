@@ -130,7 +130,12 @@ def finetune2d(
     anchor_weight: float = 10.0,
     jitter: float = 0.02,
     device: str | None = None,
+    profiles: list[list[str]] | None = None,
 ) -> dict:
+    """Fine-tune on one profile (``profile_ids``) or jointly on several
+    (``profiles``): the physics misfit is averaged across all profiles each
+    step, which regularises the adaptation toward regional data statistics
+    instead of a single line (the out-of-row generalisation fix)."""
     import h5py
 
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -146,9 +151,12 @@ def finetune2d(
         x_grid = f["x_grid"][:]
         depth_grid = f["depth_grid"][:]
 
-    if profile_ids is None:
-        profile_ids = ["MTH15", "MTH16", "WYYS1", "WYYS2", "WYYS3", "WYH18", "WYH19"]
-    prof = build_profile_obs(emtf_dir, profile_ids, freqs, station_x)
+    if profiles is None:
+        if profile_ids is None:
+            profile_ids = [
+                "MTH15", "MTH16", "WYYS1", "WYYS2", "WYYS3", "WYH18", "WYH19"
+            ]
+        profiles = [profile_ids]
 
     # model stations sit at fixed fractions of the section width: map each
     # station index to its nearest x-grid column (same layout as training).
@@ -158,38 +166,47 @@ def finetune2d(
         [int(np.argmin(np.abs(xg_norm - s))) for s in sx_norm], dtype=torch.long
     )
 
-    if model.in_channels == 4:
-        obs_np = np.stack(
-            [prof["lr_te"], prof["ph_te"] / PHASE_SCALE,
-             prof["lr_tm"], prof["ph_tm"] / PHASE_SCALE]
-        )[None].astype(np.float32)
-        # physics target: TE observations (1D column response equals both
-        # modes for a layered column; TE keeps continuity with the 1D recipe)
-        t_lr_np, t_ph_np = prof["lr_te"], prof["ph_te"]
-    else:
-        obs_np = np.stack(
-            [prof["lr"], prof["ph"] / PHASE_SCALE]
-        )[None].astype(np.float32)
-        t_lr_np, t_ph_np = prof["lr"], prof["ph"]
-    obs_np = (obs_np - ckpt["stats_mean"]) / ckpt["stats_std"]
-    x = torch.from_numpy(obs_np).to(dev)
-
-    t_lr = torch.from_numpy(t_lr_np).to(dev)
-    t_ph = torch.from_numpy(t_ph_np).to(dev)
-    t_mask = torch.from_numpy(prof["mask"]).to(dev)
     thick = torch.tensor(np.diff(depth_grid), dtype=torch.float64)
-    periods_t = torch.tensor(prof["periods"], dtype=torch.float64)
+
+    prepared = []
+    for ids in profiles:
+        prof = build_profile_obs(emtf_dir, ids, freqs, station_x)
+        if model.in_channels == 4:
+            obs_np = np.stack(
+                [prof["lr_te"], prof["ph_te"] / PHASE_SCALE,
+                 prof["lr_tm"], prof["ph_tm"] / PHASE_SCALE]
+            )[None].astype(np.float32)
+            # physics target: TE observations (1D column response equals both
+            # modes for a layered column; TE keeps continuity with the 1D recipe)
+            t_lr_np, t_ph_np = prof["lr_te"], prof["ph_te"]
+        else:
+            obs_np = np.stack(
+                [prof["lr"], prof["ph"] / PHASE_SCALE]
+            )[None].astype(np.float32)
+            t_lr_np, t_ph_np = prof["lr"], prof["ph"]
+        obs_np = (obs_np - ckpt["stats_mean"]) / ckpt["stats_std"]
+        prepared.append({
+            "x": torch.from_numpy(obs_np.astype(np.float32)).to(dev),
+            "t_lr": torch.from_numpy(t_lr_np).to(dev),
+            "t_ph": torch.from_numpy(t_ph_np).to(dev),
+            "t_mask": torch.from_numpy(prof["mask"]).to(dev),
+            "periods": torch.tensor(prof["periods"], dtype=torch.float64),
+        })
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
     history = []
     for step in range(steps):
         opt.zero_grad()
-        xin = x + jitter * torch.randn_like(x) if jitter > 0 else x
-        out_dict = model(xin)
-        phys = _physics_misfit(
-            out_dict["log_rho"][0], t_lr, t_ph, t_mask,
-            col_of_station, thick, periods_t,
-        )
+        phys_sum = 0.0
+        for pr in prepared:
+            x = pr["x"]
+            xin = x + jitter * torch.randn_like(x) if jitter > 0 else x
+            out_dict = model(xin)
+            phys_sum = phys_sum + _physics_misfit(
+                out_dict["log_rho"][0], pr["t_lr"], pr["t_ph"], pr["t_mask"],
+                col_of_station, thick, pr["periods"],
+            )
+        phys = phys_sum / len(prepared)
         reg = sum(
             (p - anchor[k]).square().sum() for k, p in model.named_parameters()
         )
@@ -205,7 +222,7 @@ def finetune2d(
     ckpt["model_state"] = model.state_dict()
     ckpt["finetune2d"] = {
         "steps": steps, "lr": lr, "anchor_weight": anchor_weight,
-        "jitter": jitter, "profile": profile_ids, "history": history,
+        "jitter": jitter, "profiles": profiles, "history": history,
     }
     torch.save(ckpt, out)
     return {"final_physics": history[-1]["physics"], "history": history}
@@ -221,11 +238,22 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=2.0e-5)
     ap.add_argument("--anchor-weight", type=float, default=10.0)
     ap.add_argument("--jitter", type=float, default=0.02)
+    ap.add_argument(
+        "--profiles", default=None,
+        help="comma-separated USArray row names (e.g. G,H-YS,I,J,K) for "
+             "joint multi-profile fine-tuning; default: Yellowstone row only",
+    )
     args = ap.parse_args()
+    profiles = None
+    if args.profiles:
+        from pimsr_benchmarks.hybrid2d import PROFILES
+
+        profiles = [PROFILES[name] for name in args.profiles.split(",")]
     result = finetune2d(
         args.checkpoint, args.emtf_dir, args.data_h5, args.out,
         steps=args.steps, lr=args.lr,
         anchor_weight=args.anchor_weight, jitter=args.jitter,
+        profiles=profiles,
     )
     print(json.dumps({"final_physics": result["final_physics"]}))
 
