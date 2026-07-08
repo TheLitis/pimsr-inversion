@@ -18,7 +18,10 @@ dependencies = [
 [project.scripts]
 pimsr-train = "pimsr_inversion.train:main"
 pimsr-train2d = "pimsr_inversion.train2d:main"
+pimsr-finetune = "pimsr_inversion.finetune:main"
 pimsr-finetune2d = "pimsr_inversion.finetune2d:main"
+pimsr-calibrate = "pimsr_inversion.calibrate:main"
+pimsr-calibrate2d = "pimsr_inversion.calibrate2d:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7", "ruff>=0.4"]
