@@ -132,6 +132,8 @@ def finetune2d(
     device: str | None = None,
     profiles: list[list[str]] | None = None,
     balance: bool = False,
+    film: bool = False,
+    profile_names: list[str] | None = None,
 ) -> dict:
     """Fine-tune on one profile (``profile_ids``) or jointly on several
     (``profiles``): the physics misfit is averaged across all profiles each
@@ -141,7 +143,14 @@ def finetune2d(
     ``balance=True`` normalises each profile's misfit by its value under the
     pretrained model, so every profile exerts equal *relative* pressure on
     the shared update. Without it, high-misfit (distorted/3D) rows dominate
-    the gradient and clean rows regress — the v4 row-J collapse."""
+    the gradient and clean rows regress — the v4 row-J collapse.
+
+    ``film=True`` adds per-profile FiLM adapters (zero-initialised gamma/beta
+    on the bottleneck): the shared weights learn the *common* regional
+    adaptation while each profile's anti-correlated distortion compensation
+    (e.g. row J vs rows I/K) is absorbed by its own 2*C_mid adapter
+    parameters. Adapters are stored in the checkpoint keyed by profile name
+    and applied at evaluation time."""
     import h5py
 
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -215,7 +224,25 @@ def finetune2d(
         print("balance: initial misfits", [round(v, 3) for v in init_misfit],
               flush=True)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
+    # per-profile FiLM adapters: zero-init (exact identity at step 0),
+    # trained at a higher lr than the anchored shared weights
+    films: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+    if film:
+        c_mid = model.mid[3].out_channels
+        films = [
+            (torch.zeros(c_mid, device=dev, requires_grad=True),
+             torch.zeros(c_mid, device=dev, requires_grad=True))
+            for _ in prepared
+        ]
+        film_params = [t for gb in films for t in gb]
+        opt = torch.optim.AdamW(
+            [{"params": list(model.parameters()), "lr": lr},
+             {"params": film_params, "lr": 50 * lr}],
+            weight_decay=0.0,
+        )
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
+
     history = []
     for step in range(steps):
         opt.zero_grad()
@@ -223,7 +250,7 @@ def finetune2d(
         for i, pr in enumerate(prepared):
             x = pr["x"]
             xin = x + jitter * torch.randn_like(x) if jitter > 0 else x
-            out_dict = model(xin)
+            out_dict = model(xin, film=films[i] if films else None)
             p_i = _physics_misfit(
                 out_dict["log_rho"][0], pr["t_lr"], pr["t_ph"], pr["t_mask"],
                 col_of_station, thick, pr["periods"],
@@ -248,6 +275,12 @@ def finetune2d(
         "jitter": jitter, "profiles": profiles, "history": history,
         "balance": balance, "init_misfit": init_misfit,
     }
+    if films is not None:
+        names = profile_names or [f"profile_{i}" for i in range(len(films))]
+        ckpt["film_adapters"] = {
+            name: {"gamma": g.detach().cpu(), "beta": b.detach().cpu()}
+            for name, (g, b) in zip(names, films)
+        }
     torch.save(ckpt, out)
     return {"final_physics": history[-1]["physics"], "history": history}
 
@@ -272,17 +305,26 @@ def main() -> None:
         help="normalise each profile's misfit by its pretrained value so "
              "hard rows cannot dominate the joint update",
     )
+    ap.add_argument(
+        "--film", action="store_true",
+        help="per-profile FiLM adapters on the bottleneck: shared weights "
+             "learn the common adaptation, adapters absorb anti-correlated "
+             "per-profile distortion compensation",
+    )
     args = ap.parse_args()
     profiles = None
+    profile_names = None
     if args.profiles:
         from pimsr_benchmarks.hybrid2d import PROFILES
 
-        profiles = [PROFILES[name] for name in args.profiles.split(",")]
+        profile_names = args.profiles.split(",")
+        profiles = [PROFILES[name] for name in profile_names]
     result = finetune2d(
         args.checkpoint, args.emtf_dir, args.data_h5, args.out,
         steps=args.steps, lr=args.lr,
         anchor_weight=args.anchor_weight, jitter=args.jitter,
         profiles=profiles, balance=args.balance,
+        film=args.film, profile_names=profile_names,
     )
     print(json.dumps({"final_physics": result["final_physics"]}))
 

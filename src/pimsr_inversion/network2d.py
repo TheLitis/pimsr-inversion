@@ -109,11 +109,22 @@ class PimsrNet2D(nn.Module):
             [t.mean(dim=(2, 3)), t.amax(dim=(2, 3))], dim=1
         )
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        film: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """``film`` — optional per-profile (gamma, beta) of shape (C_mid,)
+        applied to the bottleneck features: m * (1 + gamma) + beta.
+        Zero-initialised film is an exact identity, so adapters can be
+        added to a pretrained model without disturbing it."""
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool(e1))
         e3 = self.enc3(self.pool(e2))
         m = self.mid(e3)
+        if film is not None:
+            gamma, beta = film
+            m = m * (1.0 + gamma.view(1, -1, 1, 1)) + beta.view(1, -1, 1, 1)
 
         d2 = F.interpolate(m, size=e2.shape[-2:], mode="bilinear", align_corners=False)
         d2 = self.dec2(torch.cat([d2, e2], dim=1))

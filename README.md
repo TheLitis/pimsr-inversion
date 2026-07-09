@@ -30,7 +30,9 @@ pimsr-inversion ·
   uncertainty, TV smoothness, class-weighted CE.
 - **Physics fine-tuning** (`pimsr-finetune2d`) — masked shift-invariant
   chi-squared through a differentiable per-column 1D MT forward, with an
-  L2-SP anchor; supports multi-profile joint adaptation (`--profiles`).
+  L2-SP anchor; supports multi-profile joint adaptation (`--profiles`) and
+  balanced joint updates (`--balance`: each profile's misfit normalised by
+  its pretrained value so distorted rows cannot dominate the shared update).
 - **Post-hoc sigma calibration** (`pimsr-calibrate2d`) — affine correction of
   the log-sigma head fitted on the validation split.
 
