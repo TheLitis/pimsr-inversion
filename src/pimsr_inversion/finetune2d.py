@@ -136,6 +136,7 @@ def finetune2d(
     profile_names: list[str] | None = None,
     film_reg: float = 0.0,
     film_lr_mult: float = 50.0,
+    windows: int = 0,
 ) -> dict:
     """Fine-tune on one profile (``profile_ids``) or jointly on several
     (``profiles``): the physics misfit is averaged across all profiles each
@@ -152,7 +153,15 @@ def finetune2d(
     adaptation while each profile's anti-correlated distortion compensation
     (e.g. row J vs rows I/K) is absorbed by its own 2*C_mid adapter
     parameters. Adapters are stored in the checkpoint keyed by profile name
-    and applied at evaluation time."""
+    and applied at evaluation time.
+
+    ``windows=W`` (W >= 4) turns each profile into a *multi-sample* target:
+    besides the full station line, every contiguous window of W stations is
+    prepared as its own pseudo-section, and each training step draws one
+    random view per profile. Single-sample self-supervision is what lets a
+    profile's adapter overfit its own distorted curves (the v4 row-I
+    failure); stochastic windowing is the cheap way to break that variance
+    floor without new data."""
     import h5py
 
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -185,8 +194,7 @@ def finetune2d(
 
     thick = torch.tensor(np.diff(depth_grid), dtype=torch.float64)
 
-    prepared = []
-    for ids in profiles:
+    def _prepare_one(ids: list[str]) -> dict:
         prof = build_profile_obs(emtf_dir, ids, freqs, station_x)
         if model.in_channels == 4:
             obs_np = np.stack(
@@ -202,13 +210,28 @@ def finetune2d(
             )[None].astype(np.float32)
             t_lr_np, t_ph_np = prof["lr"], prof["ph"]
         obs_np = (obs_np - ckpt["stats_mean"]) / ckpt["stats_std"]
-        prepared.append({
+        return {
             "x": torch.from_numpy(obs_np.astype(np.float32)).to(dev),
             "t_lr": torch.from_numpy(t_lr_np).to(dev),
             "t_ph": torch.from_numpy(t_ph_np).to(dev),
             "t_mask": torch.from_numpy(prof["mask"]).to(dev),
             "periods": torch.tensor(prof["periods"], dtype=torch.float64),
-        })
+        }
+
+    # prepared[i]["views"][0] is always the full profile; the rest (if
+    # windows >= 4) are contiguous W-station sub-profiles used as random
+    # alternative views during training
+    prepared = []
+    for ids in profiles:
+        views = [_prepare_one(ids)]
+        if windows >= 4 and len(ids) > windows:
+            for k in range(len(ids) - windows + 1):
+                views.append(_prepare_one(ids[k:k + windows]))
+        prepared.append({"views": views})
+    if windows >= 4:
+        print("windows:", [len(p["views"]) for p in prepared],
+              "views per profile", flush=True)
+    rng = np.random.default_rng(0)
 
     # balanced mode: pin each profile's scale to its pretrained misfit so
     # all profiles push the shared weights with equal relative strength
@@ -217,10 +240,11 @@ def finetune2d(
         model.eval()
         with torch.no_grad():
             for i, pr in enumerate(prepared):
-                out_dict = model(pr["x"])
+                full = pr["views"][0]
+                out_dict = model(full["x"])
                 init_misfit[i] = max(float(_physics_misfit(
-                    out_dict["log_rho"][0], pr["t_lr"], pr["t_ph"],
-                    pr["t_mask"], col_of_station, thick, pr["periods"],
+                    out_dict["log_rho"][0], full["t_lr"], full["t_ph"],
+                    full["t_mask"], col_of_station, thick, full["periods"],
                 )), 1e-6)
         model.train()
         print("balance: initial misfits", [round(v, 3) for v in init_misfit],
@@ -250,12 +274,14 @@ def finetune2d(
         opt.zero_grad()
         phys_sum = 0.0
         for i, pr in enumerate(prepared):
-            x = pr["x"]
+            # stochastic view: full profile or a random station window
+            view = pr["views"][int(rng.integers(len(pr["views"])))]
+            x = view["x"]
             xin = x + jitter * torch.randn_like(x) if jitter > 0 else x
             out_dict = model(xin, film=films[i] if films else None)
             p_i = _physics_misfit(
-                out_dict["log_rho"][0], pr["t_lr"], pr["t_ph"], pr["t_mask"],
-                col_of_station, thick, pr["periods"],
+                out_dict["log_rho"][0], view["t_lr"], view["t_ph"],
+                view["t_mask"], col_of_station, thick, view["periods"],
             )
             phys_sum = phys_sum + p_i / init_misfit[i]
         phys = phys_sum / len(prepared)
@@ -284,7 +310,7 @@ def finetune2d(
     ckpt["finetune2d"] = {
         "steps": steps, "lr": lr, "anchor_weight": anchor_weight,
         "jitter": jitter, "profiles": profiles, "history": history,
-        "balance": balance, "init_misfit": init_misfit,
+        "balance": balance, "init_misfit": init_misfit, "windows": windows,
     }
     if films is not None:
         names = profile_names or [f"profile_{i}" for i in range(len(films))]
@@ -330,6 +356,11 @@ def main() -> None:
         "--film-lr-mult", type=float, default=50.0,
         help="adapter lr as a multiple of the trunk lr",
     )
+    ap.add_argument(
+        "--windows", type=int, default=0,
+        help="station window size (>=4) for stochastic multi-view "
+             "fine-tuning; 0 disables windowing",
+    )
     args = ap.parse_args()
     profiles = None
     profile_names = None
@@ -345,6 +376,7 @@ def main() -> None:
         profiles=profiles, balance=args.balance,
         film=args.film, profile_names=profile_names,
         film_reg=args.film_reg, film_lr_mult=args.film_lr_mult,
+        windows=args.windows,
     )
     print(json.dumps({"final_physics": result["final_physics"]}))
 
