@@ -31,19 +31,25 @@ _LN10 = float(np.log(10.0))
 
 
 class _MT2DResponseFn(torch.autograd.Function):
-    """log10(rho_a) and phase from a section, differentiable via Jtvec."""
+    """log10(rho_a) and phase from a section, differentiable via Jtvec.
+
+    ``mode`` selects the simulation: "te" (E-field, xy receivers, phase
+    shifted +180 into the first quadrant) or "tm" (H-field, yx receivers,
+    phase already in 0..90 deg)."""
 
     @staticmethod
-    def forward(ctx, log_rho: torch.Tensor, ph2d: "Physics2DLoss"):
+    def forward(ctx, log_rho: torch.Tensor, ph2d: "Physics2DLoss", mode: str):
+        sim = ph2d._sim if mode == "te" else ph2d._sim_tm
         lr_np = log_rho.detach().cpu().numpy().astype(float)
         sigma = ph2d._sigma_from_log_rho(lr_np)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            data = ph2d._sim.dpred(sigma)
+            data = sim.dpred(sigma)
         d = data.reshape(ph2d.n_freq, 2, ph2d.n_station)
         rho_a = np.maximum(d[:, 0, :], 1e-12)
-        phase = d[:, 1, :] + 180.0  # SimPEG xy TE -> first quadrant
+        phase = d[:, 1, :] + (180.0 if mode == "te" else 0.0)
         ctx.ph2d = ph2d
+        ctx.sim = sim
         ctx.sigma = sigma
         ctx.rho_a = rho_a
         ctx.lr_shape = log_rho.shape
@@ -61,7 +67,7 @@ class _MT2DResponseFn(torch.autograd.Function):
         v[:, 1, :] = g[1]
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            grad_sigma = ph2d._sim.Jtvec(ctx.sigma, v.ravel())
+            grad_sigma = ctx.sim.Jtvec(ctx.sigma, v.ravel())
         # chain: sigma_cell = 10**(-lr[iz, ix]) => d sigma/d lr = -ln10*sigma
         grad_lr = np.zeros(ctx.lr_shape, dtype=float).ravel()
         np.add.at(
@@ -70,7 +76,7 @@ class _MT2DResponseFn(torch.autograd.Function):
             grad_sigma[ph2d._active_idx] * (-_LN10) * ctx.sigma[ph2d._active_idx],
         )
         grad = torch.from_numpy(grad_lr.reshape(ctx.lr_shape)).to(ctx.device)
-        return grad.to(grad_out.dtype), None
+        return grad.to(grad_out.dtype), None, None
 
 
 class Physics2DLoss:
@@ -116,6 +122,7 @@ class Physics2DLoss:
             frequencies=freqs, station_x=self.x_grid[station_cols]
         )
         self._sim = self._fwd._sim
+        self._sim_tm = self._fwd._sim_tm
         self.n_freq = len(freqs)
         self.n_station = len(station_cols)
 
@@ -137,21 +144,18 @@ class Physics2DLoss:
         sigma[self._active_idx] = 10.0 ** (-log_rho.ravel()[self._flat_idx])
         return sigma
 
-    def response(self, log_rho: torch.Tensor) -> torch.Tensor:
+    def response(self, log_rho: torch.Tensor, mode: str = "te") -> torch.Tensor:
         """(2, n_freq, n_station): [log10 rho_a, phase_deg], differentiable."""
-        return _MT2DResponseFn.apply(log_rho, self)
+        return _MT2DResponseFn.apply(log_rho, self, mode)
 
-    def misfit(
+    def _mode_chi2(
         self,
-        log_rho: torch.Tensor,
+        pred: torch.Tensor,
         obs_lr: torch.Tensor,
         obs_ph: torch.Tensor,
         obs_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Static-shift-invariant chi2. Observations are (n_periods_obs,
-        n_station) on the full observed period grid; the simulator subset
-        ``obs_period_idx`` is compared."""
-        pred = self.response(log_rho)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(chi2_sum, n_points) for one mode against the simulator subset."""
         sel = torch.as_tensor(self.obs_period_idx, device=obs_lr.device)
         o_lr = obs_lr.index_select(0, sel)
         o_ph = obs_ph.index_select(0, sel)
@@ -162,5 +166,32 @@ class Physics2DLoss:
         off = ((o_lr - p_lr) * m).sum(dim=0) / w
         r_lr = (o_lr - p_lr - off[None, :]) * m / self.sigma_lr
         r_ph = (o_ph - p_ph) * m / self.sigma_ph
-        n = m.sum().clamp(min=1.0)
-        return (r_lr.square().sum() + r_ph.square().sum()) / (2.0 * n)
+        return r_lr.square().sum() + r_ph.square().sum(), m.sum()
+
+    def misfit(
+        self,
+        log_rho: torch.Tensor,
+        obs_lr: torch.Tensor,
+        obs_ph: torch.Tensor,
+        obs_mask: torch.Tensor,
+        obs_lr_tm: torch.Tensor | None = None,
+        obs_ph_tm: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Static-shift-invariant chi2. Observations are (n_periods_obs,
+        n_station) on the full observed period grid; the simulator subset
+        ``obs_period_idx`` is compared.
+
+        When TM observations are given, both polarisations are solved and
+        the chi2 is pooled. A TE-only loss lets 2D structure fit TE
+        galvanic distortion at TM's expense (v4 addendum 5); requiring
+        both modes simultaneously is what separates true 2D structure
+        from distortion."""
+        chi2, n = self._mode_chi2(
+            self.response(log_rho, "te"), obs_lr, obs_ph, obs_mask
+        )
+        if obs_lr_tm is not None and obs_ph_tm is not None:
+            chi2_tm, n_tm = self._mode_chi2(
+                self.response(log_rho, "tm"), obs_lr_tm, obs_ph_tm, obs_mask
+            )
+            chi2, n = chi2 + chi2_tm, n + n_tm
+        return chi2 / (2.0 * n.clamp(min=1.0))

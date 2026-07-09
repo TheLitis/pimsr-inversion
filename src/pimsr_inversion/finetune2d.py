@@ -204,6 +204,7 @@ def finetune2d(
 
     def _prepare_one(ids: list[str]) -> dict:
         prof = build_profile_obs(emtf_dir, ids, freqs, station_x)
+        view: dict = {}
         if model.in_channels == 4:
             obs_np = np.stack(
                 [prof["lr_te"], prof["ph_te"] / PHASE_SCALE,
@@ -212,19 +213,23 @@ def finetune2d(
             # physics target: TE observations (1D column response equals both
             # modes for a layered column; TE keeps continuity with the 1D recipe)
             t_lr_np, t_ph_np = prof["lr_te"], prof["ph_te"]
+            # TM targets for the 2D TE+TM loss (phys2d)
+            view["t_lr_tm"] = torch.from_numpy(prof["lr_tm"]).to(dev)
+            view["t_ph_tm"] = torch.from_numpy(prof["ph_tm"]).to(dev)
         else:
             obs_np = np.stack(
                 [prof["lr"], prof["ph"] / PHASE_SCALE]
             )[None].astype(np.float32)
             t_lr_np, t_ph_np = prof["lr"], prof["ph"]
         obs_np = (obs_np - ckpt["stats_mean"]) / ckpt["stats_std"]
-        return {
+        view.update({
             "x": torch.from_numpy(obs_np.astype(np.float32)).to(dev),
             "t_lr": torch.from_numpy(t_lr_np).to(dev),
             "t_ph": torch.from_numpy(t_ph_np).to(dev),
             "t_mask": torch.from_numpy(prof["mask"]).to(dev),
             "periods": torch.tensor(prof["periods"], dtype=torch.float64),
-        }
+        })
+        return view
 
     # prepared[i]["views"][0] is always the full profile; the rest (if
     # windows >= 4) are contiguous W-station sub-profiles used as random
@@ -256,8 +261,12 @@ def finetune2d(
 
     def _misfit(section, view):
         if ph2d is not None:
+            # TE+TM when TM observations exist: both polarisations must be
+            # satisfied simultaneously — a TE-only 2D loss lets structure
+            # fit TE galvanic distortion at TM's expense (v4 addendum 5)
             return ph2d.misfit(
-                section, view["t_lr"], view["t_ph"], view["t_mask"]
+                section, view["t_lr"], view["t_ph"], view["t_mask"],
+                obs_lr_tm=view.get("t_lr_tm"), obs_ph_tm=view.get("t_ph_tm"),
             )
         return _physics_misfit(
             section, view["t_lr"], view["t_ph"], view["t_mask"],
