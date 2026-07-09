@@ -137,6 +137,7 @@ def finetune2d(
     film_reg: float = 0.0,
     film_lr_mult: float = 50.0,
     windows: int = 0,
+    phys2d: bool = False,
 ) -> dict:
     """Fine-tune on one profile (``profile_ids``) or jointly on several
     (``profiles``): the physics misfit is averaged across all profiles each
@@ -161,7 +162,14 @@ def finetune2d(
     random view per profile. Single-sample self-supervision is what lets a
     profile's adapter overfit its own distorted curves (the v4 row-I
     failure); stochastic windowing is the cheap way to break that variance
-    floor without new data."""
+    floor without new data.
+
+    ``phys2d=True`` replaces the per-column 1D physics loss with the true 2D
+    TE forward (SimPEG solve + adjoint via :mod:`.physics2d`). The 1D loss
+    treats lateral/galvanic distortion as information to fit — the root cause
+    of the row-I adapter failure; the 2D forward attributes it to off-column
+    structure instead. ~1-2 s per profile per step on CPU: use ~100-200
+    steps. Incompatible with ``windows`` (station sets differ per view)."""
     import h5py
 
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -233,6 +241,29 @@ def finetune2d(
               "views per profile", flush=True)
     rng = np.random.default_rng(0)
 
+    ph2d = None
+    if phys2d:
+        if windows >= 4:
+            raise ValueError("phys2d is incompatible with windows")
+        from .physics2d import Physics2DLoss
+
+        # all profiles share the model station grid, so one solver serves all
+        ph2d = Physics2DLoss(
+            col_of_station.numpy(), x_grid, depth_grid, 1.0 / freqs
+        )
+        print(f"phys2d: {ph2d.n_freq} sim frequencies, "
+              f"{ph2d.n_station} stations", flush=True)
+
+    def _misfit(section, view):
+        if ph2d is not None:
+            return ph2d.misfit(
+                section, view["t_lr"], view["t_ph"], view["t_mask"]
+            )
+        return _physics_misfit(
+            section, view["t_lr"], view["t_ph"], view["t_mask"],
+            col_of_station, thick, view["periods"],
+        )
+
     # balanced mode: pin each profile's scale to its pretrained misfit so
     # all profiles push the shared weights with equal relative strength
     init_misfit = [1.0] * len(prepared)
@@ -242,10 +273,9 @@ def finetune2d(
             for i, pr in enumerate(prepared):
                 full = pr["views"][0]
                 out_dict = model(full["x"])
-                init_misfit[i] = max(float(_physics_misfit(
-                    out_dict["log_rho"][0], full["t_lr"], full["t_ph"],
-                    full["t_mask"], col_of_station, thick, full["periods"],
-                )), 1e-6)
+                init_misfit[i] = max(
+                    float(_misfit(out_dict["log_rho"][0], full)), 1e-6
+                )
         model.train()
         print("balance: initial misfits", [round(v, 3) for v in init_misfit],
               flush=True)
@@ -279,10 +309,7 @@ def finetune2d(
             x = view["x"]
             xin = x + jitter * torch.randn_like(x) if jitter > 0 else x
             out_dict = model(xin, film=films[i] if films else None)
-            p_i = _physics_misfit(
-                out_dict["log_rho"][0], view["t_lr"], view["t_ph"],
-                view["t_mask"], col_of_station, thick, view["periods"],
-            )
+            p_i = _misfit(out_dict["log_rho"][0], view)
             phys_sum = phys_sum + p_i / init_misfit[i]
         phys = phys_sum / len(prepared)
         reg = sum(
@@ -311,6 +338,7 @@ def finetune2d(
         "steps": steps, "lr": lr, "anchor_weight": anchor_weight,
         "jitter": jitter, "profiles": profiles, "history": history,
         "balance": balance, "init_misfit": init_misfit, "windows": windows,
+        "phys2d": phys2d,
     }
     if films is not None:
         names = profile_names or [f"profile_{i}" for i in range(len(films))]
@@ -361,6 +389,11 @@ def main() -> None:
         help="station window size (>=4) for stochastic multi-view "
              "fine-tuning; 0 disables windowing",
     )
+    ap.add_argument(
+        "--phys2d", action="store_true",
+        help="use the true 2D TE forward (SimPEG + adjoint) as the physics "
+             "loss instead of per-column 1D; ~1-2 s/profile/step",
+    )
     args = ap.parse_args()
     profiles = None
     profile_names = None
@@ -376,7 +409,7 @@ def main() -> None:
         profiles=profiles, balance=args.balance,
         film=args.film, profile_names=profile_names,
         film_reg=args.film_reg, film_lr_mult=args.film_lr_mult,
-        windows=args.windows,
+        windows=args.windows, phys2d=args.phys2d,
     )
     print(json.dumps({"final_physics": result["final_physics"]}))
 
