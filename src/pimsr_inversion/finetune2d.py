@@ -134,6 +134,8 @@ def finetune2d(
     balance: bool = False,
     film: bool = False,
     profile_names: list[str] | None = None,
+    film_reg: float = 0.0,
+    film_lr_mult: float = 50.0,
 ) -> dict:
     """Fine-tune on one profile (``profile_ids``) or jointly on several
     (``profiles``): the physics misfit is averaged across all profiles each
@@ -237,7 +239,7 @@ def finetune2d(
         film_params = [t for gb in films for t in gb]
         opt = torch.optim.AdamW(
             [{"params": list(model.parameters()), "lr": lr},
-             {"params": film_params, "lr": 50 * lr}],
+             {"params": film_params, "lr": film_lr_mult * lr}],
             weight_decay=0.0,
         )
     else:
@@ -261,8 +263,17 @@ def finetune2d(
             (p - anchor[k]).square().sum() for k, p in model.named_parameters()
         )
         loss = phys + anchor_weight * reg
+        if films is not None and film_reg > 0:
+            # anchor adapters to identity (zero gamma/beta): stops a single
+            # heavily-distorted profile from overfitting its own adapter
+            f_reg = sum(g.square().sum() + b.square().sum() for g, b in films)
+            loss = loss + film_reg * f_reg / len(films)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if films is not None:
+            torch.nn.utils.clip_grad_norm_(
+                [t for gb in films for t in gb], 1.0
+            )
         opt.step()
         if step % 25 == 0 or step == steps - 1:
             p, a = float(phys.detach()), float(reg.detach())
@@ -311,6 +322,14 @@ def main() -> None:
              "learn the common adaptation, adapters absorb anti-correlated "
              "per-profile distortion compensation",
     )
+    ap.add_argument(
+        "--film-reg", type=float, default=0.0,
+        help="L2 penalty anchoring adapters to identity (per profile mean)",
+    )
+    ap.add_argument(
+        "--film-lr-mult", type=float, default=50.0,
+        help="adapter lr as a multiple of the trunk lr",
+    )
     args = ap.parse_args()
     profiles = None
     profile_names = None
@@ -325,6 +344,7 @@ def main() -> None:
         anchor_weight=args.anchor_weight, jitter=args.jitter,
         profiles=profiles, balance=args.balance,
         film=args.film, profile_names=profile_names,
+        film_reg=args.film_reg, film_lr_mult=args.film_lr_mult,
     )
     print(json.dumps({"final_physics": result["final_physics"]}))
 
