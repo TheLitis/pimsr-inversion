@@ -131,11 +131,17 @@ def finetune2d(
     jitter: float = 0.02,
     device: str | None = None,
     profiles: list[list[str]] | None = None,
+    balance: bool = False,
 ) -> dict:
     """Fine-tune on one profile (``profile_ids``) or jointly on several
     (``profiles``): the physics misfit is averaged across all profiles each
     step, which regularises the adaptation toward regional data statistics
-    instead of a single line (the out-of-row generalisation fix)."""
+    instead of a single line (the out-of-row generalisation fix).
+
+    ``balance=True`` normalises each profile's misfit by its value under the
+    pretrained model, so every profile exerts equal *relative* pressure on
+    the shared update. Without it, high-misfit (distorted/3D) rows dominate
+    the gradient and clean rows regress — the v4 row-J collapse."""
     import h5py
 
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -193,19 +199,36 @@ def finetune2d(
             "periods": torch.tensor(prof["periods"], dtype=torch.float64),
         })
 
+    # balanced mode: pin each profile's scale to its pretrained misfit so
+    # all profiles push the shared weights with equal relative strength
+    init_misfit = [1.0] * len(prepared)
+    if balance and len(prepared) > 1:
+        model.eval()
+        with torch.no_grad():
+            for i, pr in enumerate(prepared):
+                out_dict = model(pr["x"])
+                init_misfit[i] = max(float(_physics_misfit(
+                    out_dict["log_rho"][0], pr["t_lr"], pr["t_ph"],
+                    pr["t_mask"], col_of_station, thick, pr["periods"],
+                )), 1e-6)
+        model.train()
+        print("balance: initial misfits", [round(v, 3) for v in init_misfit],
+              flush=True)
+
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
     history = []
     for step in range(steps):
         opt.zero_grad()
         phys_sum = 0.0
-        for pr in prepared:
+        for i, pr in enumerate(prepared):
             x = pr["x"]
             xin = x + jitter * torch.randn_like(x) if jitter > 0 else x
             out_dict = model(xin)
-            phys_sum = phys_sum + _physics_misfit(
+            p_i = _physics_misfit(
                 out_dict["log_rho"][0], pr["t_lr"], pr["t_ph"], pr["t_mask"],
                 col_of_station, thick, pr["periods"],
             )
+            phys_sum = phys_sum + p_i / init_misfit[i]
         phys = phys_sum / len(prepared)
         reg = sum(
             (p - anchor[k]).square().sum() for k, p in model.named_parameters()
@@ -223,6 +246,7 @@ def finetune2d(
     ckpt["finetune2d"] = {
         "steps": steps, "lr": lr, "anchor_weight": anchor_weight,
         "jitter": jitter, "profiles": profiles, "history": history,
+        "balance": balance, "init_misfit": init_misfit,
     }
     torch.save(ckpt, out)
     return {"final_physics": history[-1]["physics"], "history": history}
@@ -243,6 +267,11 @@ def main() -> None:
         help="comma-separated USArray row names (e.g. G,H-YS,I,J,K) for "
              "joint multi-profile fine-tuning; default: Yellowstone row only",
     )
+    ap.add_argument(
+        "--balance", action="store_true",
+        help="normalise each profile's misfit by its pretrained value so "
+             "hard rows cannot dominate the joint update",
+    )
     args = ap.parse_args()
     profiles = None
     if args.profiles:
@@ -253,7 +282,7 @@ def main() -> None:
         args.checkpoint, args.emtf_dir, args.data_h5, args.out,
         steps=args.steps, lr=args.lr,
         anchor_weight=args.anchor_weight, jitter=args.jitter,
-        profiles=profiles,
+        profiles=profiles, balance=args.balance,
     )
     print(json.dumps({"final_physics": result["final_physics"]}))
 
