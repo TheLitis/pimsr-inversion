@@ -33,6 +33,14 @@ pimsr-inversion ·
   L2-SP anchor; supports multi-profile joint adaptation (`--profiles`) and
   balanced joint updates (`--balance`: each profile's misfit normalised by
   its pretrained value so distorted rows cannot dominate the shared update).
+  Optional extensions: per-profile FiLM adapters on the bottleneck
+  (`--film`, regularised via `--film-reg`/`--film-lr-mult`), stochastic
+  station-window views (`--windows`), and the **TE+TM 2D physics loss**
+  (`--phys2d`, `physics2d.py`) — SimPEG 2D forwards in both polarisations
+  wrapped in a custom autograd Function with FD-validated adjoint
+  gradients. Requiring both modes simultaneously is what separates genuine
+  2D structure from galvanic distortion (a TE-only 2D loss is actively
+  harmful; see the benchmarks REPORT, v4 addenda 5-6).
 - **Post-hoc sigma calibration** (`pimsr-calibrate2d`) — affine correction of
   the log-sigma head fitted on the validation split.
 
