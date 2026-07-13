@@ -46,6 +46,7 @@ def train(args) -> dict:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and config.precision == "fp16")
     start_epoch = 0
+    history = []
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     resume = Path(args.resume) if args.resume else out / "last3d.pt"
@@ -56,9 +57,9 @@ def train(args) -> dict:
         scheduler.load_state_dict(state["scheduler_state"])
         scaler.load_state_dict(state["scaler_state"])
         start_epoch = int(state["epoch"]) + 1
+        history = list(state.get("history", []))
 
     dtype = torch.bfloat16 if config.precision == "bf16" else torch.float16
-    history = []
     for epoch in range(start_epoch, args.epochs):
         model.train()
         total = 0.0
